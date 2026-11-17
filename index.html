@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replay – listening helper prototype</title>
+<style>
+  html { font-size: 16px; }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
+  h1 { margin-bottom: .2rem; }
+  #status { color: #aaa; }
+  #about { background: #1d2a1d; padding: .8rem 1rem; border-radius: 12px; line-height: 1.5; }
+  #about a { color: #8fd18f; font-size: 1.1rem; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin: .6rem 0; }
+  button { font-size: 1.3rem; padding: 1rem 1.5rem; border-radius: 12px; border: none; cursor: pointer; }
+  #start { background: #2e7d32; color: #fff; }
+  #stop { background: #b71c1c; color: #fff; }
+  #replay { background: #1565c0; color: #fff; font-size: 2rem; width: 100%; padding: 2rem; margin-top: 1rem; }
+  button:disabled { opacity: .4; cursor: default; }
+  label { font-size: 1.1rem; }
+  select, input[type=checkbox] { font-size: 1.1rem; transform-origin: left center; }
+  #captions { font-size: 1.8rem; line-height: 1.4; min-height: 6rem; margin-top: 1rem; }
+  #captions.quiet { color: #555; font-size: 1.2rem; font-style: italic; }
+  #replayText { font-size: 1.6rem; background: #222; padding: 1rem; border-radius: 12px; margin-top: 1rem; min-height: 3rem; }
+  #count { color: #aaa; margin-top: .6rem; }
+  kbd { background: #333; border-radius: 4px; padding: 0 .35rem; }
+  #todoBox { background: #2a2416; border-radius: 12px; padding: .8rem 1rem; margin-top: 1.2rem; }
+  #todoBox h2 { margin: 0 0 .3rem; font-size: 1.4rem; }
+  #todoHint { color: #aaa; font-size: .95rem; margin: 0 0 .5rem; }
+  #todoList { list-style: none; padding: 0; margin: 0; }
+  #todoList li { display: flex; align-items: flex-start; gap: .6rem; font-size: 1.3rem; padding: .4rem 0; border-bottom: 1px solid #3a3322; }
+  #todoList li.done span { text-decoration: line-through; color: #777; }
+  #todoList input { width: 1.4rem; height: 1.4rem; margin-top: .3rem; }
+  #todoList .remove { background: none; color: #aaa; font-size: 1.2rem; padding: 0 .4rem; margin-left: auto; }
+  #clearTodos { background: #444; color: #eee; font-size: 1rem; padding: .5rem 1rem; margin-top: .6rem; }
+</style>
+</head>
+<body>
+<h1>Replay</h1>
+
+<div id="about">
+  <strong>Thanks for testing Replay!</strong> This is an early prototype that helps you catch what someone just said.
+  <ul>
+    <li>Use Chrome on a laptop, and wear headphones.</li>
+    <li>Tap <em>Start listening</em>, let people talk, then tap <em>Replay</em> (or press <kbd>Space</kbd>) whenever you miss something.</li>
+    <li>Sound stays in memory on your device and only the last 15 seconds are kept. Nothing is saved.
+      The live captions use Chrome's built-in speech service, which sends audio to Google to turn it into text.</li>
+    <li>Only use it in conversations where everyone knows and agrees.</li>
+    <li>Replay is a listening aid, not a medical device or a treatment for CAPD or hearing loss.
+      It doesn't replace advice from an audiologist or doctor.</li>
+  </ul>
+  <a id="feedback" href="#" target="_blank" rel="noopener">Done testing? Tell me how it went →</a>
+</div>
+
+<p id="status">Tap Start, then allow the microphone.</p>
+
+<div class="row">
+  <button id="start">Start listening</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+
+<div class="row">
+  <label>Replay speed:
+    <select id="speed">
+      <option value="1">Normal</option>
+      <option value="0.85">A bit slower</option>
+      <option value="0.7" selected>Slower</option>
+      <option value="0.55">Much slower</option>
+    </select>
+  </label>
+  <label>Text size:
+    <select id="textSize">
+      <option value="16">Normal</option>
+      <option value="20">Large</option>
+      <option value="24">Extra large</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="quiet"> Quiet mode (hide live captions)</label>
+</div>
+
+<div id="captions"></div>
+<button id="replay" disabled>⟲ Replay last 15 seconds <small>(Space)</small></button>
+<div id="replayText"></div>
+<div id="count">Replays used this session: 0</div>
+
+<div id="todoBox">
+  <h2>✓ Things to do</h2>
+  <p id="todoHint">When someone says things like "bring," "turn in," "due," or "don't forget," Replay adds it here automatically.</p>
+  <ul id="todoList"></ul>
+  <button id="clearTodos">Clear list</button>
+</div>
+<audio id="player"></audio>
+
+<script>
+// ---------- Settings ----------
+const SECONDS = 15;   // how much audio to remember
+// Paste your Google Form link between the quotes:
+const FEEDBACK_URL = "PASTE-YOUR-GOOGLE-FORM-LINK-HERE";
+
+// ---------- State ----------
+let ctx, sampleRate, stream, proc, source, rec;
+let listening = false;
+let chunks = [];      // small pieces of sound (the rolling buffer)
+let totalSamples = 0;
+let lines = [];       // caption lines: { time, text }
+let replayCount = 0;
+
+const $ = id => document.getElementById(id);
+
+// Feedback link: hide the placeholder until a real form link is pasted in
+if (FEEDBACK_URL.startsWith("http")) {
+  $('feedback').href = FEEDBACK_URL;
+} else {
+  $('feedback').removeAttribute('href');
+  $('feedback').textContent = 'Feedback form coming soon.';
+}
+
+// ---------- STEP A: start the microphone and keep only the last 15 seconds ----------
+$('start').onclick = async () => {
+  $('start').blur();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true }
+    });
+    ctx = new AudioContext();
+    sampleRate = ctx.sampleRate;
+    source = ctx.createMediaStreamSource(stream);
+    proc = ctx.createScriptProcessor(4096, 1, 1);
+
+    proc.onaudioprocess = e => {
+      const piece = new Float32Array(e.inputBuffer.getChannelData(0));
+      chunks.push(piece);
+      totalSamples += piece.length;
+      // throw away the oldest pieces once we have more than 15 seconds
+      while (chunks.length > 1 && totalSamples - chunks[0].length >= SECONDS * sampleRate) {
+        totalSamples -= chunks.shift().length;
+      }
+    };
+    source.connect(proc);
+    proc.connect(ctx.destination); // keeps the browser running it (it outputs silence)
+
+    listening = true;
+    startCaptions();
+    $('start').disabled = true;
+    $('stop').disabled = false;
+    $('replay').disabled = false;
+    $('status').textContent = 'Listening. Only the last 15 seconds are kept, in memory.';
+  } catch (err) {
+    $('status').textContent = 'Could not use the microphone: ' + err.message;
+  }
+};
+
+// ---------- Item 1: Stop button (turns the mic off and forgets everything) ----------
+$('stop').onclick = () => {
+  $('stop').blur();
+  listening = false;
+  try { rec && rec.stop(); } catch (_) {}
+  if (proc) proc.disconnect();
+  if (source) source.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  $('player').pause();
+  chunks = []; totalSamples = 0; lines = [];
+  $('captions').textContent = '';
+  $('replayText').textContent = '';
+  $('start').disabled = false;
+  $('stop').disabled = true;
+  $('replay').disabled = true;
+  $('status').textContent = 'Stopped. Microphone is off and the audio and captions are cleared. Your checklist stays until you clear it.';
+};
+
+// ---------- Instruction finder (simple, no AI): spot "to-do" phrases ----------
+const TASK_WORDS = /\b(bring|turn in|turn it in|hand in|due|deadline|don't forget|dont forget|do not forget|remember to|make sure|need to|needs to|have to|has to|submit|sign up|fill out|finish|send)\b/i;
+let todos = [];   // { text, done }
+
+function checkForTask(text) {
+  if (!TASK_WORDS.test(text)) return;
+  const clean = text.charAt(0).toUpperCase() + text.slice(1);
+  if (todos.some(t => t.text.toLowerCase() === clean.toLowerCase())) return; // no duplicates
+  todos.push({ text: clean, done: false });
+  renderTodos();
+}
+
+function renderTodos() {
+  const list = $('todoList');
+  list.innerHTML = '';
+  todos.forEach((t, i) => {
+    const li = document.createElement('li');
+    if (t.done) li.className = 'done';
+
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = t.done;
+    box.onchange = () => { t.done = box.checked; box.blur(); renderTodos(); };
+
+    const span = document.createElement('span');
+    span.textContent = t.text;   // textContent keeps it safe
+
+    const remove = document.createElement('button');
+    remove.className = 'remove';
+    remove.title = 'Remove';
+    remove.textContent = '✕';
+    remove.onclick = () => { todos.splice(i, 1); renderTodos(); };
+
+    li.append(box, span, remove);
+    list.append(li);
+  });
+}
+
+$('clearTodos').onclick = () => { $('clearTodos').blur(); todos = []; renderTodos(); };
+
+// ---------- STEP B: live captions ----------
+function startCaptions() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { $('captions').textContent = 'Live captions need Chrome or Edge.'; return; }
+
+  rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = 'en-US';
+
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) {
+        const text = r[0].transcript.trim();
+        lines.push({ time: Date.now(), text });
+        checkForTask(text);
+      }
+      else interim += r[0].transcript;
+    }
+    lines = lines.filter(l => l.time > Date.now() - 60000); // keep 1 minute of text
+    renderCaptions(lines.slice(-3).map(l => l.text).join(' ') + ' ' + interim);
+  };
+  // the browser stops listening after a pause, so start again (unless Stop was pressed)
+  rec.onend = () => { if (listening) { try { rec.start(); } catch (_) {} } };
+  rec.start();
+}
+
+let lastCaption = '';
+function renderCaptions(text) {
+  lastCaption = text;
+  const box = $('captions');
+  if ($('quiet').checked) {
+    box.classList.add('quiet');
+    box.textContent = listening ? 'Quiet mode is on. Captions will show when you replay.' : '';
+  } else {
+    box.classList.remove('quiet');
+    box.textContent = text;
+  }
+}
+
+// ---------- Item 5: quiet mode and text size ----------
+$('quiet').onchange = () => { renderCaptions(lastCaption); $('quiet').blur(); };
+$('textSize').onchange = () => {
+  document.documentElement.style.fontSize = $('textSize').value + 'px';
+  $('textSize').blur();
+};
+$('speed').onchange = () => $('speed').blur();
+
+// ---------- STEP C: Replay ----------
+function doReplay() {
+  if (!listening || !totalSamples) return;
+
+  // glue the pieces into one recording
+  const pcm = new Float32Array(totalSamples);
+  let offset = 0;
+  for (const c of chunks) { pcm.set(c, offset); offset += c.length; }
+
+  const p = $('player');
+  if (p.src) URL.revokeObjectURL(p.src);
+  p.src = URL.createObjectURL(toWav(pcm, sampleRate));
+
+  // slow it down without making voices sound deep
+  const speed = parseFloat($('speed').value);
+  p.preservesPitch = true;
+  p.defaultPlaybackRate = speed;
+  p.playbackRate = speed;
+  p.play();
+
+  // show the words from the same 15 seconds
+  const cutoff = Date.now() - SECONDS * 1000;
+  $('replayText').textContent =
+    lines.filter(l => l.time >= cutoff).map(l => l.text).join(' ') || '(no words caught)';
+
+  // Item 3: replay counter (only shown on this screen, never sent anywhere)
+  replayCount++;
+  $('count').textContent = 'Replays used this session: ' + replayCount;
+}
+$('replay').onclick = () => { $('replay').blur(); doReplay(); };
+
+// ---------- Item 4: Spacebar = Replay ----------
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space' || e.repeat) return;
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  e.preventDefault();
+  doReplay();
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space' && e.target.tagName === 'BUTTON') e.preventDefault();
+});
+
+// Helper: turn raw sound numbers into a .wav file the audio player understands
+function toWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8, 'WAVE');
+  w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  let o = 44;
+  for (const s of samples) {
+    const x = Math.max(-1, Math.min(1, s));
+    v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+    o += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+</script>
+</body>
+</html>
